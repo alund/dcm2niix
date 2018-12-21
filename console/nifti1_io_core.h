@@ -49,6 +49,7 @@ AA.m[3][0]=AA.m[3][1]=AA.m[3][2]=0.0f , AA.m[3][3]=1.0f            )
 #undef  ASSIF  // assign v to *p, if possible
 #define ASSIF(p,v) if( (p)!=NULL ) *(p) = (v)
 float dotProduct(vec3 u, vec3 v);
+float normVec3(vec3 u);
 float nifti_mat33_determ( mat33 R ) ;
 int isSameFloat (float a, float b) ;
 int isSameDouble (double a, double b) ;
@@ -60,6 +61,7 @@ mat44 nifti_dicom2mat(float orient[7], float patientPosition[4], float xyzMM[4])
 mat44 nifti_mat44_inverse( mat44 R );
 mat44 nifti_mat44_mul( mat44 A , mat44 B );
 vec3 crossProduct(vec3 u, vec3 v);
+vec3 subtractVec3(vec3 u, vec3 v);
 vec3 nifti_vect33_norm (vec3 v);
 vec3 nifti_vect33mat33_mul(vec3 v, mat33 m );
 ivec3 setiVec3(int x, int y, int z);

@@ -118,6 +118,18 @@ float dotProduct(vec3 u, vec3 v)
     return (u.v[0]*v.v[0] + v.v[1]*u.v[1] + v.v[2]*u.v[2]);
 }
 
+float normVec3(vec3 u) {
+    return sqrt(u.v[0] * u.v[0] +
+                u.v[1] * u.v[1] +
+                u.v[2] * u.v[2]);
+}
+
+vec3 subtractVec3(vec3 u, vec3 v) {
+    return setVec3(u.v[0] - v.v[0],
+                   u.v[1] - v.v[1],
+                   u.v[2] - v.v[2]);
+}
+
 vec3 nifti_vect33_norm (vec3 v) { //normalize vector length
     vec3 vO = v;
     float vLen = sqrt( (v.v[0]*v.v[0])

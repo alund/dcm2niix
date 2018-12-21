@@ -322,6 +322,10 @@ void siemensPhilipsCorrectBvecs(struct TDICOMdata *d, int sliceDir, struct TDTI 
     	printWarning("Saving %d DTI gradients. Validate vectors (image slice orientation not reported, e.g. 2001,100B).\n", d->CSA.numDti);
 }// siemensPhilipsCorrectBvecs()
 
+int isSameFloatT (float a, float b, float tolerance) {
+	return (fabs (a - b) <= tolerance);
+}
+
 bool isNanPosition(struct TDICOMdata d) { //in 2007 some Siemens RGB DICOMs did not include the PatientPosition 0020,0032 tag
     if (isnan(d.patientPosition[1])) return true;
     if (isnan(d.patientPosition[2])) return true;
@@ -1515,22 +1519,114 @@ int * nii_SaveDTI(char pathoutname[],int nConvert, struct TDCMsort dcmSort[],str
     return volOrderIndex;
 }// nii_SaveDTI()
 
-float sqr(float v){
-    return v*v;
-}// sqr()
+vec3 patientPositionVec3(struct TDICOMdata d) {
+    return setVec3(d.patientPosition[1], d.patientPosition[2], d.patientPosition[3]);
+}// patientPositionVec3
 
-float intersliceDistance(struct TDICOMdata d1, struct TDICOMdata d2) {
+vec3 rowOrientationVec3(struct TDICOMdata d) {
+    return setVec3(d.orient[1], d.orient[2], d.orient[3]);
+}// patientOrientationRowVec3
+
+vec3 columnOrientationVec3(struct TDICOMdata d) {
+    return setVec3(d.orient[4], d.orient[5], d.orient[6]);
+}// patientOrientationColumnVec3
+
+void printVector(const char *name, vec3 u) {
+    printMessage("%s = [%f, %f, %f]; norm(%s) = %f\n", name, u.v[0], u.v[1], u.v[2], name, normVec3(u));
+}
+
+float intersliceDistance(struct TDICOMdata d1, struct TDICOMdata d2, bool correctTilt) {
     //some MRI scans have gaps between slices, some CT have overlapping slices. Comparing adjacent slices provides measure for dx between slices
     if ( isNanPosition(d1) ||  isNanPosition(d2))
         return d1.xyzMM[3];
-    float tilt = 1.0;
-    //printMessage("0020,0032 %g %g %g -> %g %g %g\n",d1.patientPosition[1],d1.patientPosition[2],d1.patientPosition[3],d2.patientPosition[1],d2.patientPosition[2],d2.patientPosition[3]);
-    if (d1.gantryTilt != 0)
-        tilt = (float) cos(d1.gantryTilt  * M_PI/180); //for CT scans with gantry tilt, we need to compute distance between slices, not distance along bed
-    return tilt * sqrt( sqr(d1.patientPosition[1]-d2.patientPosition[1])+
-                sqr(d1.patientPosition[2]-d2.patientPosition[2])+
-                sqr(d1.patientPosition[3]-d2.patientPosition[3]));
-} //intersliceDistance()
+
+    vec3 diffVector = subtractVec3(patientPositionVec3(d2), patientPositionVec3(d1));
+    // printVector("diffVector", diffVector);
+
+    if (correctTilt) {
+        // For CT scans with gantry tilt, we need to compute distance between slices, not distance along bed.
+        vec3 orthVector = nifti_vect33_norm(crossProduct(rowOrientationVec3(d1), columnOrientationVec3(d1)));
+        // printVector("orthVector", orthVector);
+        return fabs(dotProduct(orthVector, diffVector));
+    }
+    else {
+        return normVec3(diffVector);
+    }
+}//intersliceDistance()
+
+float intersliceTiltAngle(struct TDICOMdata d1, struct TDICOMdata d2) {
+    // Compute the tilt angle between two slices.  This is the angle away from normal that the difference between
+    // slice positions forms with the column orientation vector.
+
+    // If no position information is available, return NAN.
+    if (isNanPosition(d1) || isNanPosition(d2))
+        return NAN;
+
+    // Compute a unit vector in the direction from the first slice to the second
+    vec3 diffVector = nifti_vect33_norm(subtractVec3(patientPositionVec3(d2), patientPositionVec3(d1)));
+    // printVector("rowVector", rowOrientationVec3(d1));
+    // printVector("columnVector", columnOrientationVec3(d1));
+    // printVector("diffVector", diffVector);
+
+    // Calculate the angle, negating and converting to degrees so this can be substituted for TDICOMdata.gantryTilt.
+    float angle = (float) (-asin(dotProduct(columnOrientationVec3(d1), diffVector)) * 180.0 / M_PI);
+
+    // Also calculate any tilt in the direction of the rows, even though this will not be corrected.
+    float transverseAngle = -asin(dotProduct(rowOrientationVec3(d1), diffVector)) * 180 / M_PI;
+    if (!isSameFloat(0.0, transverseAngle)) {
+        printWarning("Detected transverse (row) tilt of %f degrees; this will not be corrected.\n", transverseAngle);
+    }
+
+    return angle;
+}//intersliceTiltAngle()
+
+float nominalTiltAngle(struct TDICOMdata d1) {
+    float angle = d1.gantryTilt;
+
+    // unintuitive step: reverse sign for negative gantry tilt, therefore -27deg == +27deg (why @!?#)
+    // seen in http://www.mathworks.com/matlabcentral/fileexchange/28141-gantry-detector-tilt-correction/content/gantry2.m
+    // also validated with actual data...
+    if (d1.manufacturer == kMANUFACTURER_PHILIPS) //see 'Manix' example from Osirix
+        angle = - angle;
+    else if ((d1.manufacturer == kMANUFACTURER_SIEMENS) && (angle > 0.0))
+        angle = - angle;
+    else if (d1.manufacturer == kMANUFACTURER_GE)
+        ; //do nothing
+    else if (angle < 0.0)
+        angle = - angle; //see Toshiba examples from John Muschelli
+
+    return angle;
+}//nominalTiltAngle()
+
+float effectiveTiltAngle(struct TDICOMdata d1, struct TDICOMdata d2) {
+    float computedAngle = intersliceTiltAngle(d1, d2);
+    float nominalAngle = nominalTiltAngle(d1);
+
+    if (!isnan(computedAngle)) {
+        float tolerance = 0.0001;
+        // If the two angles are almost equal, use the nominalAngle. This will be less surprising.
+        if (isSameFloatT(computedAngle, nominalAngle, tolerance))
+            return nominalAngle;
+
+        // Treat very small angles as zero so that no tilt correction will be done.
+        if (isSameFloatT(0.0, computedAngle, tolerance))
+            computedAngle = 0.0;
+
+        if (!isSameFloatT(computedAngle, nominalAngle, tolerance)) {
+            if (computedAngle == 0.0)
+                printMessage("Computed tilt angle is 0 while nominal tilt angle is %f. Was the image already resampled?\n",
+                             nominalAngle);
+            else
+                printWarning("Computed tilt angle %f is different than nominal tilt angle %f. The computed angle will be used.\n",
+                             computedAngle, nominalAngle);
+        }
+        return computedAngle;
+    }
+    else {
+        // If no angle could be computed, just use the nominal angle.
+        return nominalAngle;
+    }
+}// effectiveTiltAngle
 
 void swapDim3Dim4(int d3, int d4, struct TDCMsort dcmSort[]) {
     //swap space and time: input A0,A1...An,B0,B1...Bn output A0,B0,A1,B1,...
@@ -2379,7 +2475,7 @@ int siemensCtKludge(int nConvert, struct TDCMsort dcmSort[],struct TDICOMdata dc
     if ((nConvert < 2) ||(dcmList[indx0].manufacturer != kMANUFACTURER_SIEMENS) || (!isSameFloat(dcmList[indx0].TR ,0.0f))) return nConvert;
     float prevDx = 0.0;
     for (int i = 1; i < nConvert; i++) {
-        float dx = intersliceDistance(dcmList[indx0],dcmList[dcmSort[i].indx]);
+        float dx = intersliceDistance(dcmList[indx0],dcmList[dcmSort[i].indx], false);
         if ((!isSameFloat(dx,0.0f)) && (dx < prevDx)) {
             printMessage("Slices skipped: image position not sequential, admonish your vendor (Siemens OOG?)\n");
             return i;
@@ -2389,11 +2485,7 @@ int siemensCtKludge(int nConvert, struct TDCMsort dcmSort[],struct TDICOMdata dc
     return nConvert; //all images in sequential order
 }// siemensCtKludge()
 
-int isSameFloatT (float a, float b, float tolerance) {
-    return (fabs (a - b) <= tolerance);
-}
-
-unsigned char * nii_saveNII3DtiltFloat32(char * niiFilename, struct nifti_1_header * hdr, unsigned char* im, struct TDCMopts opts, float * sliceMMarray, float gantryTiltDeg, int manufacturer ) {
+unsigned char * nii_saveNII3DtiltFloat32(char * niiFilename, struct nifti_1_header * hdr, unsigned char* im, struct TDCMopts opts, float * sliceMMarray, float gantryTiltDeg) {
     //correct for gantry tilt - http://www.mathworks.com/matlabcentral/fileexchange/24458-dicom-gantry-tilt-correction
     if (opts.isOnlyBIDS) return im;
     if (gantryTiltDeg == 0.0) return im;
@@ -2406,17 +2498,6 @@ unsigned char * nii_saveNII3DtiltFloat32(char * niiFilename, struct nifti_1_head
     }
     printMessage("Gantry Tilt Correction is new: please validate conversions\n");
     float GNTtanPx = tan(gantryTiltDeg / (180/M_PI))/hdrIn.pixdim[2]; //tangent(degrees->radian)
-    //unintuitive step: reverse sign for negative gantry tilt, therefore -27deg == +27deg (why @!?#)
-    // seen in http://www.mathworks.com/matlabcentral/fileexchange/28141-gantry-detector-tilt-correction/content/gantry2.m
-    // also validated with actual data...
-    if (manufacturer == kMANUFACTURER_PHILIPS) //see 'Manix' example from Osirix
-        GNTtanPx = - GNTtanPx;
-    else if ((manufacturer == kMANUFACTURER_SIEMENS) && (gantryTiltDeg > 0.0))
-        GNTtanPx = - GNTtanPx;
-    else if (manufacturer == kMANUFACTURER_GE)
-        ; //do nothing
-    else
-    	if (gantryTiltDeg < 0.0) GNTtanPx = - GNTtanPx; //see Toshiba examples from John Muschelli
     // printMessage("gantry tilt pixels per mm %g\n",GNTtanPx);
     float * imIn32 = ( float*) im;
 	//create new output image: larger due to skew
@@ -2471,7 +2552,7 @@ unsigned char * nii_saveNII3DtiltFloat32(char * niiFilename, struct nifti_1_head
     return imOut;
 }// nii_saveNII3DtiltFloat32()
 
-unsigned char * nii_saveNII3Dtilt(char * niiFilename, struct nifti_1_header * hdr, unsigned char* im, struct TDCMopts opts, float * sliceMMarray, float gantryTiltDeg, int manufacturer ) {
+unsigned char * nii_saveNII3Dtilt(char * niiFilename, struct nifti_1_header * hdr, unsigned char* im, struct TDCMopts opts, float * sliceMMarray, float gantryTiltDeg) {
     //correct for gantry tilt - http://www.mathworks.com/matlabcentral/fileexchange/24458-dicom-gantry-tilt-correction
     if (opts.isOnlyBIDS) return im;
     if (gantryTiltDeg == 0.0) return im;
@@ -2479,24 +2560,13 @@ unsigned char * nii_saveNII3Dtilt(char * niiFilename, struct nifti_1_header * hd
     int nVox2DIn = hdrIn.dim[1]*hdrIn.dim[2];
     if ((nVox2DIn < 1) || (hdrIn.dim[0] != 3) || (hdrIn.dim[3] < 3)) return im;
     if (hdrIn.datatype == DT_FLOAT32)
-        return nii_saveNII3DtiltFloat32(niiFilename, hdr, im, opts, sliceMMarray, gantryTiltDeg, manufacturer);
+        return nii_saveNII3DtiltFloat32(niiFilename, hdr, im, opts, sliceMMarray, gantryTiltDeg);
     if (hdrIn.datatype != DT_INT16) {
         printMessage("Only able to correct gantry tilt for 16-bit integer data with at least 3 slices.");
         return im;
     }
     printMessage("Gantry Tilt Correction is new: please validate conversions\n");
     float GNTtanPx = tan(gantryTiltDeg / (180/M_PI))/hdrIn.pixdim[2]; //tangent(degrees->radian)
-    //unintuitive step: reverse sign for negative gantry tilt, therefore -27deg == +27deg (why @!?#)
-    // seen in http://www.mathworks.com/matlabcentral/fileexchange/28141-gantry-detector-tilt-correction/content/gantry2.m
-    // also validated with actual data...
-    if (manufacturer == kMANUFACTURER_PHILIPS) //see 'Manix' example from Osirix
-        GNTtanPx = - GNTtanPx;
-    else if ((manufacturer == kMANUFACTURER_SIEMENS) && (gantryTiltDeg > 0.0))
-        GNTtanPx = - GNTtanPx;
-    else if (manufacturer == kMANUFACTURER_GE)
-        ; //do nothing
-    else
-        if (gantryTiltDeg < 0.0) GNTtanPx = - GNTtanPx; //see Toshiba examples from John Muschelli
     // printMessage("gantry tilt pixels per mm %g\n",GNTtanPx);
     short * imIn16 = ( short*) im;
 	//create new output image: larger due to skew
@@ -3024,8 +3094,9 @@ int saveDcm2NiiCore(int nConvert, struct TDCMsort dcmSort[],struct TDICOMdata dc
     //printMessage(" %d %d %d %d %lu\n", hdr0.dim[1], hdr0.dim[2], hdr0.dim[3], hdr0.dim[4], (unsigned long)[imgM length]);
     if (nConvert > 1) {
         //next: determine gantry tilt
-        if (dcmList[indx0].gantryTilt != 0.0f)
-            printMessage(" Warning: note these images have gantry tilt of %g degrees (manufacturer ID = %d)\n", dcmList[indx0].gantryTilt, dcmList[indx0].manufacturer);
+		float tiltAngle = nominalTiltAngle(dcmList[indx0]);
+        if (tiltAngle != 0.0f)
+            printMessage(" Warning: note these images have gantry tilt of %g degrees (manufacturer ID = %d)\n", tiltAngle, dcmList[indx0].manufacturer);
         if (hdr0.dim[3] < 2) {
             //stack volumes with multiple acquisitions
             int nAcq = 1;
@@ -3106,11 +3177,16 @@ int saveDcm2NiiCore(int nConvert, struct TDCMsort dcmSort[],struct TDICOMdata dc
 				} //if trVaries
             } //if PET
             //next: detect variable inter-slice distance
-            float dx = intersliceDistance(dcmList[dcmSort[0].indx],dcmList[dcmSort[1].indx]);
-            bool dxVaries = false;
-            for (int i = 1; i < nConvert; i++)
-                if (!isSameFloatT(dx,intersliceDistance(dcmList[dcmSort[i-1].indx],dcmList[dcmSort[i].indx]),0.2))
-                    dxVaries = true;
+            float dx = intersliceDistance(dcmList[dcmSort[0].indx],dcmList[dcmSort[1].indx], false);
+			float dxMin = dx;
+			float dxMax = dx;
+            for (int i = 2; i < nConvert; i++) {
+            	dx = intersliceDistance(dcmList[dcmSort[i-1].indx],dcmList[dcmSort[i].indx], false);
+            	if (dx < dxMin) dxMin = dx;
+            	if (dx > dxMax) dxMax = dx;
+            }
+			float dxMean = intersliceDistance(dcmList[dcmSort[0].indx], dcmList[dcmSort[nConvert - 1].indx], false) / (nConvert - 1);
+			bool dxVaries = !isSameFloatT(dxMin, dxMax, 0.2);
             if (hdr0.dim[4] < 2) {
                 if (dxVaries) {
                     sliceMMarray = (float *) malloc(sizeof(float)*nConvert);
@@ -3120,7 +3196,7 @@ int saveDcm2NiiCore(int nConvert, struct TDCMsort dcmSort[],struct TDICOMdata dc
                     printMessage(" Distance from first slice:\n");
                     printMessage("dx=[0");
                     for (int i = 1; i < nConvert; i++) {
-                        float dx0 = intersliceDistance(dcmList[dcmSort[0].indx],dcmList[dcmSort[i].indx]);
+                        float dx0 = intersliceDistance(dcmList[dcmSort[0].indx],dcmList[dcmSort[i].indx], false);
                         printMessage(" %g", dx0);
                         sliceMMarray[i] = dx0;
                     }
@@ -3137,20 +3213,20 @@ int saveDcm2NiiCore(int nConvert, struct TDCMsort dcmSort[],struct TDICOMdata dc
 
                 }
             }
-            if ((hdr0.dim[4] > 0) && (dxVaries) && (dx == 0.0) &&  ((dcmList[dcmSort[0].indx].manufacturer == kMANUFACTURER_GE)  || (dcmList[dcmSort[0].indx].manufacturer == kMANUFACTURER_PHILIPS))  ) { //Niels Janssen has provided GE sequential multi-phase acquisitions that also require swizzling
+            if ((hdr0.dim[4] > 0) && (dxVaries) && (dxMin == 0.0) &&  ((dcmList[dcmSort[0].indx].manufacturer == kMANUFACTURER_GE)  || (dcmList[dcmSort[0].indx].manufacturer == kMANUFACTURER_PHILIPS))  ) { //Niels Janssen has provided GE sequential multi-phase acquisitions that also require swizzling
                 swapDim3Dim4(hdr0.dim[3],hdr0.dim[4],dcmSort);
-                dx = intersliceDistance(dcmList[dcmSort[0].indx],dcmList[dcmSort[1].indx]);
-                printMessage("swizzling 3rd and 4th dimensions (XYTZ -> XYZT), assuming interslice distance is %f\n",dx);
+				dxMean = intersliceDistance(dcmList[dcmSort[0].indx], dcmList[dcmSort[nConvert - 1].indx], false) / (nConvert - 1);
+                printMessage("swizzling 3rd and 4th dimensions (XYTZ -> XYZT), assuming interslice distance is %f\n",dxMean);
             }
-            if ((dx == 0.0 ) && (!dxVaries)) { //all images are the same slice - 16 Dec 2014
+            if (isSameFloat(0.0, dxMean) && (!dxVaries)) { //all images are the same slice - 16 Dec 2014
                 printMessage(" Warning: all images appear to be a single slice - please check slice/vector orientation\n");
                 hdr0.dim[3] = 1;
                 hdr0.dim[4] = nConvert;
                 hdr0.dim[0] = 4;
             }
-            if ((dx > 0) && (!isSameFloatGE(dx, hdr0.pixdim[3])))
-            	hdr0.pixdim[3] = dx;
-            dcmList[dcmSort[0].indx].xyzMM[3] = dx; //16Sept2014 : correct DICOM for true distance between slice centers:
+            if ((dxMean > 0) && (!isSameFloatGE(dxMean, hdr0.pixdim[3])))
+            	hdr0.pixdim[3] = dxMean;
+            dcmList[dcmSort[0].indx].xyzMM[3] = dxMean; //16Sept2014 : correct DICOM for true distance between slice centers:
             // e.g. MCBI Siemens ToF 0018:0088 reports 16mm SpacingBetweenSlices, but actually 0.5mm
         } else if (hdr0.dim[4] < 2) {
             hdr0.dim[4] = nConvert;
@@ -3443,11 +3519,16 @@ int saveDcm2NiiCore(int nConvert, struct TDCMsort dcmSort[],struct TDICOMdata dc
 #endif
     }
 #endif
-    if (dcmList[indx0].gantryTilt != 0.0) {
-        if (dcmList[indx0].isResampled) {
-            printMessage("Tilt correction skipped: 0008,2111 reports RESAMPLED\n");
-        } else if (opts.isTiltCorrect) {
-            imgM = nii_saveNII3Dtilt(pathoutname, &hdr0, imgM,opts, sliceMMarray, dcmList[indx0].gantryTilt, dcmList[indx0].manufacturer);
+    float gantryTilt = effectiveTiltAngle(dcmList[indx0], dcmList[indx1]);
+    if (!isSameFloat(0.0, gantryTilt)) {
+        if (opts.isTiltCorrect) {
+            // The slice spacing was calculated above without tilt correction. Recalculate with tilt correction here.
+            struct nifti_1_header tiltHdr0  = hdr0;
+            float dxMean = intersliceDistance(dcmList[dcmSort[0].indx], dcmList[dcmSort[nConvert - 1].indx], true) / (nConvert - 1);
+            if ((dxMean > 0) && (!isSameFloatGE(dxMean, tiltHdr0.pixdim[3])))
+                tiltHdr0.pixdim[3] = dxMean;
+            dcmList[dcmSort[0].indx].xyzMM[3] = dxMean;
+            imgM = nii_saveNII3Dtilt(pathoutname, &tiltHdr0, imgM, opts, sliceMMarray, gantryTilt);
             strcat(pathoutname,"_Tilt");
         } else
             printMessage("Tilt correction skipped\n");
